@@ -1,0 +1,426 @@
+% =====================================================================
+%  CSE 344 - System Programming - Homework #6 : "Magic Academy"
+%  Report template (Overleaf ready).
+%
+%  RECOMMENDED COMPILER: LuaLaTeX or XeLaTeX  (needed for the "Caveat"
+%  hand-written font via fontspec).  It also compiles under pdfLaTeX,
+%  in which case the hand-written annotations fall back to an italic font.
+%
+%  In Overleaf:  Menu  ->  Compiler  ->  LuaLaTeX
+% =====================================================================
+% !TeX program = lualatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}        % harmless under LuaLaTeX/XeLaTeX
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{tcolorbox}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,shapes.multipart,fit,backgrounds,calc}
+
+% ---------------------------------------------------------------------
+%  Hand-written "Caveat" font for stylized annotations / blockquotes.
+%  Uses fontspec when available, otherwise degrades gracefully.
+% ---------------------------------------------------------------------
+\usepackage{iftex}
+\ifPDFTeX
+  % pdfLaTeX fallback: an italic serif stands in for the hand-written look.
+  \newcommand{\handfont}{\itshape}
+\else
+  \usepackage{fontspec}
+  % "Caveat" ships with most Overleaf installations; if missing, swap the
+  % name below for any installed hand-written font (e.g. "Patrick Hand").
+  \newfontfamily{\CaveatFamily}{Caveat}
+  \newcommand{\handfont}{\CaveatFamily}
+\fi
+
+% A margin/annotation note that looks hand-written.
+\newcommand{\annot}[1]{{\handfont\large\color{teal}#1}}
+
+% A "scribbled remark" callout box.
+\newtcolorbox{remark}{
+  colback=teal!4, colframe=teal!55!black, boxrule=0.6pt, arc=2pt,
+  left=8pt, right=8pt, top=6pt, bottom=6pt,
+  fontupper=\handfont\large
+}
+
+% ---------------------------------------------------------------------
+%  Source-code listing style
+% ---------------------------------------------------------------------
+\lstdefinestyle{c}{
+  language=C, basicstyle=\ttfamily\footnotesize, breaklines=true,
+  keywordstyle=\color{blue!70!black}, commentstyle=\color{green!45!black},
+  stringstyle=\color{purple!70!black}, numbers=left, numberstyle=\tiny\color{gray},
+  frame=single, framesep=4pt, rulecolor=\color{gray!40},
+  showstringspaces=false, tabsize=4, xleftmargin=14pt
+}
+\lstset{style=c}
+
+\hypersetup{colorlinks=true, linkcolor=blue!50!black, urlcolor=blue!55!black}
+
+% =====================================================================
+\begin{document}
+
+% ----------------------------- Title page ----------------------------
+\begin{titlepage}
+\centering
+\vspace*{2.5cm}
+{\Huge\bfseries Magic Academy\par}
+\vspace{0.4cm}
+{\Large A Single-Threaded \texttt{select()} TCP Server\par}
+\vspace{1.6cm}
+{\large CSE 344 -- System Programming\par}
+{\large Homework \#6\par}
+\vspace{2.2cm}
+\begin{tabular}{rl}
+  \textbf{Name:}        & \texttt{<Your Name>}\\[4pt]
+  \textbf{Student ID:}  & \texttt{<Your ID>}\\[4pt]
+  \textbf{Course:}      & CSE 344 -- System Programming\\[4pt]
+  \textbf{Homework:}    & \#6 -- Magic Academy\\[4pt]
+  \textbf{Date:}        & \today\\
+\end{tabular}
+\vfill
+\annot{Hogwarts opens its gates every morning\ldots\ and closes them on \texttt{Ctrl+C}.}
+\vfill
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+% =====================================================================
+\section{Overview}
+This homework implements three programs that communicate over TCP:
+
+\begin{itemize}[nosep]
+  \item \textbf{\texttt{hogwarts}} -- the academy server. It loads a list of
+        magical ingredients, accepts wizard and professor connections, keeps
+        per-client state (username, type, line buffer, spellbook, last-activity
+        timestamp), enforces a maximum number of simultaneous clients and an
+        idle timeout, and shuts down cleanly on \texttt{SIGINT}.
+  \item \textbf{\texttt{wizard}} -- a TCP client that auto-enrolls as a wizard
+        and can issue \texttt{BREW}, \texttt{CONSUME}, \texttt{SPELLBOOK},
+        \texttt{INSPECT}, \texttt{SCROLL}, \texttt{ROSTER}, \texttt{APPARATE}.
+  \item \textbf{\texttt{professor}} -- a TCP client that auto-enrolls as a
+        professor; it may query (\texttt{INSPECT}, \texttt{SCROLL},
+        \texttt{ROSTER}) but the server rejects \texttt{BREW}/\texttt{CONSUME}
+        from it with \texttt{ERR UNAUTHORIZED}.
+\end{itemize}
+
+\begin{remark}
+The whole server is one process, one thread, one \texttt{select()} loop --
+no \texttt{pthread}, no \texttt{fork} per client, no \texttt{sleep()}.
+\end{remark}
+
+\paragraph{Build \& run.}
+\begin{lstlisting}[language=bash]
+$ make                       # builds hogwarts, wizard, professor
+$ ./hogwarts -p 5000 -s ingredients.txt -l server.log -n 4 -t 30
+$ ./wizard    127.0.0.1 5000 hermione
+$ ./professor 127.0.0.1 5000 dumbledore
+$ make clean
+\end{lstlisting}
+
+% =====================================================================
+\section{System Design}
+
+\subsection{One loop, many clients}
+The server keeps a fixed-size array \texttt{client\_t clients[max\_clients]}.
+A free slot is marked by \texttt{fd == -1}. Each iteration of the main loop:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Idle sweep.} Walk the array; for every connected client compute
+        \texttt{elapsed = now - last\_active}. If \texttt{elapsed >= TIMEOUT},
+        send \texttt{TIMEOUT DISCONNECT}, log \texttt{TIMEOUT} and
+        \texttt{CLIENT\_DISCONNECTED reason=timeout}, \texttt{close()} the fd
+        and free the slot.
+  \item \textbf{Build the \texttt{fd\_set}.} \texttt{FD\_ZERO}, then
+        \texttt{FD\_SET} the listening socket and every connected client fd;
+        track \texttt{maxfd}.
+  \item \textbf{Recompute the timeout.} For every connected client compute the
+        remaining time \texttt{TIMEOUT - elapsed}; the smallest value becomes
+        the \texttt{struct timeval} passed to \texttt{select()}. If there are
+        no clients, \texttt{NULL} is passed (block indefinitely).
+  \item \textbf{\texttt{select()}.} Wait for readability on any fd, or until the
+        nearest idle deadline expires.
+  \item \textbf{Dispatch.} If the listening socket is ready, \texttt{accept()} a
+        new connection (\S\ref{sec:capacity}). For every ready client fd, read
+        available bytes into its line buffer and process complete lines.
+\end{enumerate}
+
+\annot{The select() timeout is recomputed from scratch \emph{before every call}
+-- that is how idle disconnection happens without a timer thread or sleep().}
+
+\subsection{Idle timeout without threads or sleep}
+\texttt{time()} (whole seconds, monotone enough for a 1\,s-granularity timeout)
+stamps \texttt{last\_active} on every byte received from a client. Because the
+sweep runs \emph{before} \texttt{select()} and the \texttt{select()} timeout is
+the minimum remaining lifetime, the loop always wakes up no later than the next
+client's deadline, disconnects it, and recomputes. \texttt{SIGINT} is handled by
+not setting \texttt{SA\_RESTART}, so \texttt{select()} returns \texttt{EINTR} and
+the loop notices the shutdown flag promptly.
+
+\subsection{Capacity enforcement}\label{sec:capacity}
+On a new connection the server always calls \texttt{accept()} first (so the
+client gets a real error rather than a silent hang). If the number of occupied
+slots already equals \texttt{max\_clients}, it sends \texttt{ERR HOGWARTS\_FULL},
+logs \texttt{REJECTED fd=N ip=X.X.X.X reason=HOGWARTS\_FULL}, and
+\texttt{close()}s the fd \emph{without} storing it. A slot is reclaimed the
+instant a client disconnects (APPARATE / hangup / timeout), so capacity
+recovers immediately.
+
+\subsection{Block diagram}
+\begin{center}
+\begin{tikzpicture}[
+  font=\small,
+  box/.style={draw, rounded corners=3pt, align=center, minimum height=10mm,
+              inner sep=5pt, fill=blue!4},
+  proc/.style={draw, rounded corners=8pt, align=center, fill=teal!8,
+               minimum height=12mm, inner sep=6pt},
+  store/.style={draw, align=center, fill=orange!8, minimum height=10mm,
+                inner sep=5pt},
+  rec/.style={draw, rectangle split, rectangle split parts=2, align=left,
+              fill=purple!5, inner sep=4pt},
+  flow/.style={-{Stealth[length=2.4mm]}, thick},
+  thin flow/.style={-{Stealth[length=2mm]}, gray}
+]
+
+% --- the kernel side ---
+\node[box] (listen) {listening socket\\ \texttt{listen\_fd}};
+\node[box, below=10mm of listen] (c1) {client socket fd$_1$};
+\node[box, below=6mm of c1]      (c2) {client socket fd$_2$};
+\node[box, below=6mm of c2]      (cn) {client socket fd$_n$};
+
+% --- the select() core ---
+\node[proc, right=26mm of c1, yshift=4mm] (sel)
+  {\texttt{select(maxfd+1,\&rfds,\dots,\&tv)}\\[2pt]
+   \scriptsize tv = min remaining idle time};
+\node[proc, above=9mm of sel] (loop)
+  {single-threaded main loop\\ \scriptsize sweep $\to$ build fd\_set $\to$ select $\to$ dispatch};
+
+% --- per-client state ---
+\node[rec, right=26mm of sel] (state)
+  {\texttt{client\_t} \nodepart{two}
+   \scriptsize fd\\ username[32]\\ type[16]\\ line\_buf[512]\\ last\_active\\ spellbook[\,]};
+\node[store, above=9mm of state] (clients) {\texttt{clients[max\_clients]}\\ \scriptsize array of slots};
+\node[store, below=10mm of state] (ing)   {\texttt{ingredients[\,]}\\ \scriptsize name $\to$ global qty};
+\node[store, below=8mm of ing]   (log)    {logfile + stdout\\ \scriptsize timestamped events};
+
+% --- wires ---
+\draw[flow] (listen.east) -- node[above,scriptsize]{accept()} (loop.west|-listen) -- (loop.west);
+\draw[flow] (c1.east) -- (sel.west);
+\draw[flow] (c2.east) -- (sel.west);
+\draw[flow] (cn.east) -- (sel.west);
+\draw[flow] (loop) -- (sel);
+\draw[flow] (sel.east) -- node[above,scriptsize]{read / write line} (state.west);
+\draw[thin flow] (clients) -- (state);
+\draw[thin flow] (state) -- (ing) node[midway,right,scriptsize]{BREW / CONSUME};
+\draw[thin flow] (loop.east) to[out=0,in=90] (clients.north);
+\draw[thin flow] (state) -- (log);
+
+\begin{scope}[on background layer]
+  \node[draw=gray!40, dashed, rounded corners, fit=(listen)(c1)(c2)(cn),
+        label=above:{\scriptsize kernel TCP sockets}] {};
+  \node[draw=gray!40, dashed, rounded corners, fit=(loop)(sel),
+        label=above:{\scriptsize \texttt{hogwarts} -- one thread}] {};
+  \node[draw=gray!40, dashed, rounded corners, fit=(clients)(state)(ing)(log),
+        label=above:{\scriptsize server state}] {};
+\end{scope}
+\end{tikzpicture}
+\end{center}
+
+% =====================================================================
+\section{Data Structures}
+
+\subsection{\texttt{client\_t}}
+\begin{lstlisting}
+typedef struct {
+    int    fd;                          /* -1 == free slot                     */
+    char   username[MAX_USERNAME];      /* from ENROLL                          */
+    char   type[MAX_TYPE];              /* "WIZARD" / "PROFESSOR" / ""          */
+    int    enrolled;                    /* 1 after a valid ENROLL               */
+    char   line_buf[MAX_LINE];          /* partial-read accumulator (<= 512 B)  */
+    size_t buf_len;                     /* bytes currently held in line_buf     */
+    int    overlong;                    /* 1 while draining an over-long line   */
+    time_t last_active;                 /* timestamp of last byte received      */
+    long   spellbook[MAX_INGREDIENTS];  /* WIZARD only: per-ingredient holdings */
+} client_t;
+\end{lstlisting}
+All slots live in one heap array \texttt{client\_t *clients = calloc(max\_clients,
+sizeof(client\_t))}. Lookup, capacity counting and username-uniqueness checks
+are simple linear scans -- \texttt{max\_clients} is small, so this is fine and
+keeps the code branch-free of dynamic containers.
+
+\subsection{Spellbook}
+A wizard's spellbook is a plain \texttt{long[MAX\_INGREDIENTS]} indexed by the
+ingredient's position in the global table. \texttt{BREW} adds to both
+\texttt{ingredients[i].qty} and \texttt{spellbook[i]}; \texttt{CONSUME} subtracts
+from both. \texttt{CONSUME} is refused with \texttt{ERR INSUFFICIENT\_INGREDIENTS}
+unless the wizard holds at least the requested amount (and the global stock does
+too). Because every brew first increases the global stock, the global quantity
+is always $\ge$ any single wizard's holding, so the global stock can never go
+negative. The spellbook is \emph{not} persisted: when the client disconnects the
+slot (and the array) is zeroed.
+
+\subsection{Ingredient table}
+\begin{lstlisting}
+typedef struct { char name[MAX_ING_NAME]; long qty; } ingredient_t;
+static ingredient_t g_ing[MAX_INGREDIENTS];
+static int          g_ning;
+\end{lstlisting}
+Loaded once at start-up from \texttt{ingredients.txt}. Each line is parsed with
+\texttt{sscanf("\%63s \%ld", \dots)}; lines whose name is not 1--16 uppercase
+alphanumerics/underscores, whose quantity is not a positive integer, or which
+duplicate an earlier name, are skipped silently.
+
+% =====================================================================
+\section{Partial Read / Write Handling}
+TCP is a byte stream: one \texttt{read()} may return half a command, one and a
+half commands, or several commands glued together.
+
+\paragraph{Reads.} Each client owns \texttt{line\_buf[512]}. On a readable fd the
+server does one \texttt{read()} into a scratch buffer and then walks the bytes:
+\begin{itemize}[nosep]
+  \item a \verb|'\n'| ends a line -- the bytes accumulated in \texttt{line\_buf}
+        (with a trailing \verb|'\r'| trimmed) become a NUL-terminated command
+        that is dispatched, then \texttt{buf\_len} is reset to 0;
+  \item any other byte is appended to \texttt{line\_buf};
+  \item if \texttt{line\_buf} would overflow 512 bytes without a newline, the
+        server replies \texttt{ERR TOOLONG}, sets the \texttt{overlong} flag and
+        discards bytes until the next \verb|'\n'| -- so a malicious or buggy peer
+        cannot corrupt memory or desynchronise the parser.
+\end{itemize}
+Leftover bytes (a half command) simply stay in \texttt{line\_buf} until the next
+\texttt{read()} delivers the rest.
+
+\paragraph{Writes.} Every reply goes through \texttt{send\_all()}, which loops on
+\texttt{write()} until the whole buffer is gone, retrying on \texttt{EINTR} and
+advancing the offset on short writes. \texttt{SIGPIPE} is ignored so a write to a
+peer that vanished returns \texttt{-1/EPIPE} instead of killing the process.
+
+% =====================================================================
+\section{Signal Handling and Shutdown}
+
+\subsection{Server -- \texttt{Ctrl+C}}
+\begin{enumerate}[nosep]
+  \item \texttt{SIGINT} is caught by a handler that does exactly one
+        async-signal-safe thing: \texttt{g\_stop = 1} (a
+        \texttt{volatile sig\_atomic\_t}).
+  \item The handler is installed \emph{without} \texttt{SA\_RESTART}, so a
+        \texttt{select()} in progress returns \texttt{-1} with \texttt{errno ==
+        EINTR}; the loop treats that as "re-check the flag".
+  \item Seeing \texttt{g\_stop}, the loop leaves \texttt{while (!g\_stop)} and
+        enters shutdown: send \texttt{SERVER SHUTDOWN} to every connected client,
+        \texttt{close()} every client fd, \texttt{close()} the listening socket,
+        \texttt{free()} the client array, \texttt{fclose()} the logfile.
+  \item It logs \texttt{SHUTDOWN signal=SIGINT} and \texttt{CLEANUP\_DONE
+        clients=0} and \texttt{return}s -- no orphan fds, no zombies (there are no
+        child processes).
+\end{enumerate}
+
+\subsection{Wizard / professor -- \texttt{Ctrl+C}}
+\begin{enumerate}[nosep]
+  \item \texttt{SIGINT} sets \texttt{g\_stop = 1}; the client's \texttt{select()}
+        loop (a 1\,s tick keeps it responsive) notices it.
+  \item The client sends \texttt{APPARATE}, prints
+        \texttt{[ROLE user] SENT APPARATE}, stops reading stdin, and waits for the
+        reply.
+  \item On \texttt{OK APPARATE} it prints \texttt{[ROLE user] DISCONNECTED
+        reason=APPARATE}, \texttt{close()}s the socket and exits 0. (If the
+        server is already gone it gives up after a short bounded wait.)
+\end{enumerate}
+The client also exits cleanly on \texttt{SERVER SHUTDOWN}
+(\texttt{reason=shutdown}), on \texttt{TIMEOUT DISCONNECT}
+(\texttt{reason=timeout}), and on EOF of stdin (it sends \texttt{APPARATE} first).
+
+% =====================================================================
+\section{Mandatory Test Scenarios}
+\emph{Replace each placeholder with an uncut screenshot of the corresponding
+terminal -- from the shell prompt through program exit. One screenshot per
+terminal.}
+
+\newcommand{\shot}[1]{%
+  \begin{center}\fbox{\parbox[c][32mm][c]{0.85\linewidth}{\centering\ttfamily\small
+  [ screenshot placeholder: #1 ]}}\end{center}}
+
+\subsection{Scenario 1 -- enrollment errors, NOT\_ENROLLED, UNKNOWN, professor BREW}
+Server \texttt{-n 4 -t 30}. Two clients enroll; a third tries the same username
+(\texttt{ERR ENROLL name\_taken}); a fourth sends a command before enrolling
+(\texttt{ERR NOT\_ENROLLED}); \texttt{FLY BROOMSTICK} $\to$ \texttt{ERR UNKNOWN
+FLY}; the professor's \texttt{BREW}/\texttt{CONSUME} $\to$ \texttt{ERR
+UNAUTHORIZED}; the wizard's \texttt{INSPECT}/\texttt{SCROLL} succeed; both leave
+with \texttt{Ctrl+C}.
+\shot{server} \shot{wizard hermione} \shot{professor dumbledore}
+\shot{wizard hermione (duplicate)} \shot{third client (pre-ENROLL)}
+
+\subsection{Scenario 2 -- BREW/CONSUME, spellbook, INSUFFICIENT, UNKNOWN ingredient}
+Harry brews \texttt{MOONSTONE}/\texttt{UNICORN\_HAIR}, checks \texttt{SPELLBOOK},
+over-consumes \texttt{UNICORN\_HAIR} (\texttt{ERR INSUFFICIENT\_INGREDIENTS}),
+brews an unknown ingredient (\texttt{ERR UNKNOWN\_INGREDIENT}); McGonagall does
+\texttt{INSPECT}/\texttt{SCROLL}/\texttt{ROSTER}.
+\shot{server} \shot{wizard harry} \shot{professor mcgonagall}
+
+\subsection{Scenario 3 -- HOGWARTS\_FULL and slot recovery}
+Server \texttt{-n 3 -t 60}. Three clients fill the academy; the next two get
+\texttt{ERR HOGWARTS\_FULL}; harry leaves; \texttt{neville} now fits, brews,
+\texttt{ROSTER} reflects the change; everyone leaves with \texttt{Ctrl+C}.
+\shot{server} \shot{harry} \shot{ron} \shot{dumbledore}
+\shot{voldemort (rejected)} \shot{snape (rejected)} \shot{neville}
+
+\subsection{Scenario 4 -- idle timeout + clean server shutdown}
+Server \texttt{-n 6 -t 10}. \texttt{hermione} stays active; \texttt{harry} sends
+nothing for 10\,s and is dropped with \texttt{TIMEOUT DISCONNECT}; more clients
+join and query; the server gets \texttt{Ctrl+C}; \texttt{ps aux | grep hogwarts}
+shows no leftover process; \texttt{cat server.log} shows the full timeline.
+\shot{server + ps + cat server.log} \shot{hermione} \shot{harry (timed out)}
+\shot{ron} \shot{dumbledore} \shot{mcgonagall}
+
+% =====================================================================
+\section{Challenges}
+
+\paragraph{1. Recomputing the \texttt{select()} timeout correctly.}
+A first version passed a fixed \texttt{struct timeval} to \texttt{select()}, which
+meant idle clients were only noticed when \emph{some other} fd happened to be
+ready. The fix was to (a) run the idle sweep \emph{before} building the fd set,
+and (b) set the \texttt{select()} timeout to the minimum of
+\texttt{TIMEOUT - (now - last\_active)} over all clients (and \texttt{NULL} when
+there are no clients). Now the loop is guaranteed to wake up no later than the
+next deadline, with no \texttt{sleep()} and no timer thread.
+
+\paragraph{2. Message boundaries vs.\ \texttt{read()} boundaries.}
+Sending two commands quickly, or a command split across packets, initially caused
+either lost or merged commands. Adding a per-client \texttt{line\_buf} plus a
+byte-at-a-time scan for \verb|'\n'| (with CRLF tolerance, an \texttt{ERR TOOLONG}
+guard, and leftover bytes retained for the next \texttt{read()}) made the parser
+robust to arbitrary fragmentation.
+
+\paragraph{3. (Bonus) File-descriptor and slot leaks on disconnect.}
+Every disconnect path -- \texttt{APPARATE}, peer hangup ($\texttt{read()} = 0$),
+read error, idle timeout and global shutdown -- funnels through one
+\texttt{client\_close()} that \texttt{close()}s the fd and zeroes the slot
+(including the spellbook). A quick \texttt{lsof}/\texttt{ps} check after a
+storm of connect/disconnect confirmed no fd growth and no zombie processes.
+
+% =====================================================================
+\section*{Appendix: Output line formats}
+\addcontentsline{toc}{section}{Appendix: Output line formats}
+\begin{itemize}[nosep]
+  \item Server, to stdout \emph{and} the logfile, one timestamped line per
+        event: \texttt{[YYYY-MM-DD HH:MM:SS] KEYWORD field=value \dots}
+        (e.g.\ \texttt{SERVER\_STARTED}, \texttt{CLIENT\_CONNECTED},
+        \texttt{ENROLL}, \texttt{BREW}, \texttt{CONSUME}, \texttt{INSPECT},
+        \texttt{SCROLL}, \texttt{ROSTER}, \texttt{REJECTED}, \texttt{TIMEOUT},
+        \texttt{CLIENT\_DISCONNECTED}, \texttt{SHUTDOWN}, \texttt{CLEANUP\_DONE}).
+        Plus the one-off \texttt{Hogwarts is ready. Port: \dots} banner.
+  \item Clients, to stdout: \texttt{[WIZARD <user>]} / \texttt{[PROFESSOR <user>]}
+        followed by \texttt{CONNECTED}, \texttt{SENT}, \texttt{RECEIVED} or
+        \texttt{DISCONNECTED}; a \texttt{> } prompt precedes each typed command.
+\end{itemize}
+
+\end{document}

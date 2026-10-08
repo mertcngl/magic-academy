@@ -1,0 +1,24 @@
+# Executables
+hogwarts
+wizard
+professor
+*.exe
+*.o
+*.obj
+*.out
+
+# Logs
+*.log
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.toc
+
+# Editor directories
+.vscode/
+.idea/
